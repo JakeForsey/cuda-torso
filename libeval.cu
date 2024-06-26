@@ -96,7 +96,7 @@ extern "C" {
             size_t B,
             size_t N
     ) {
-        _evaluate<<<64, B / 64>>>(adjs, perms, degrees, fitnesses, B, N);
+        _evaluate<<<128, B / 128>>>(adjs, perms, degrees, fitnesses, B, N);
         cudaDeviceSynchronize();
     }
 }

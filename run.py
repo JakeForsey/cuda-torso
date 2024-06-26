@@ -1,6 +1,8 @@
 import argparse
 import ctypes
 from ctypes import c_size_t, c_bool, c_uint16, c_int, POINTER
+import json
+import math
 import os
 import time
 
@@ -17,6 +19,7 @@ GRAPH_SIZES = {
 }
 
 
+# Initialise custom CUDA kerrnel to quickly evaluate solutions
 libeval = ctypes.CDLL('./libeval.so', mode=ctypes.RTLD_GLOBAL)
 evaluate = libeval.evaluate
 evaluate.argtypes = [
@@ -30,6 +33,8 @@ evaluate.argtypes = [
 
 
 def main():
+    torch.set_grad_enabled(False)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--graph", choices=set(GRAPH_SIZES.keys()), default="small-graph")
     parser.add_argument("--eigenvectors", type=int, default=32)
@@ -62,13 +67,16 @@ def main():
     degrees = torch.empty((B, N), dtype=torch.uint32).cuda()
     fitnesses = torch.full((B, N), 999999, dtype=torch.int).cuda()
     elite_fitnesses = torch.full((N, ), 999999, dtype=torch.int).cuda()
+
     elite_range = torch.ones((N, ), dtype=torch.float32, device="cuda") / B
+    ts = torch.arange(0, N, math.ceil(N / 20)).cuda()
 
     logits = torch.empty((B, N), dtype=torch.float32).cuda()
 
+    # Run multiple generations of neuro-evolution
     for generation in range(args.max_generations):
         start = time.perf_counter()
-        logits = population @ nodes
+        logits[:] = population @ nodes
         perms[:] = logits.argsort(axis=1).to(torch.uint16)
         adjs[:, :, :] = bkup_adjs[:, :, :]
         evaluate(
@@ -93,12 +101,27 @@ def main():
         population += torch.normal(0.0, 0.3, (B, E), device="cuda") * mask
 
         if generation % args.log_every == 0:
+            # Log stats
             runtime = time.perf_counter() - start
-            print(f"{generation} | {runtime / args.log_every:3.2f} | {(B * args.log_every)/runtime:3.2f} | {best.values.sum()} | {elite_fitnesses.sum()}")
+            degrees = elite_fitnesses[ts]
+            hvi = calculate_hvi(ts, degrees, N)
+            print(f"{generation} | {runtime / args.log_every:3.2f} | {(B * args.log_every)/runtime:3.2f} | {best.values.sum()} | {elite_fitnesses.sum()} | {hvi}")
 
         if generation % args.checkpoint_every == 0:
-            path = f"checkpoints/{args.graph}/{elite_fitnesses.sum()}.pt"
-            if not os.path.exists(path):
+            # Checkpoint progress
+
+            # Submission
+            degrees = elite_fitnesses[ts]
+            hvi = calculate_hvi(ts, degrees, N)
+            submission = create_submission(elites, nodes, ts, args.graph)
+            submission_path = f"submissions/{args.graph}/{hvi}.json"
+            if not os.path.exists(submission_path):
+                with open(submission_path, "w") as f:
+                    json.dump(submission, f)
+            
+            # State
+            checkpoint_path = f"checkpoints/{args.graph}/{elite_fitnesses.sum()}.pt"
+            if not os.path.exists(checkpoint_path):
                 torch.save(
                     {
                         "args": vars(args),
@@ -106,8 +129,34 @@ def main():
                         "elites": elites,
                         "elite_fitnesses": elite_fitnesses,
                     },
-                    path,
+                    checkpoint_path,
                 )
+
+
+def create_submission(elites, nodes, ts, graph):
+    """Create a submission based on the elites."""
+    logits = elites @ nodes
+    perms = logits.argsort(axis=1)
+    return {
+        "challenge": "spoc-3-torso-decompositions",
+        "problem": graph,
+        "decisionVector": [perm.tolist() + [t.item()] for perm, t in zip(perms[ts].cpu(), ts.cpu())],
+    }
+
+
+def calculate_hvi(ts, degrees, N):
+    """Calculate the Hyper Volume Indicator used to score a submission."""
+    area = 0
+    for i in range(len(ts)):
+        degree = degrees[i].item()
+        previous_degree = degrees[i - 1].item() if i != 0 else N
+        x = ts[i].item()
+        y = degree
+        dx = N - x
+        dy = previous_degree - y
+        contribution = dx * dy
+        area += contribution
+    return -area
 
 
 def init_adj(N, graph):
