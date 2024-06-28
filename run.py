@@ -38,15 +38,20 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--graph", choices=set(GRAPH_SIZES.keys()), default="small-graph")
     parser.add_argument("--eigenvectors", type=int, default=32)
+    parser.add_argument("--init_stdev", type=float, default=0.3)
+    parser.add_argument("--mutation_stdev", type=float, default=0.3)
+    parser.add_argument("--mutation_proba", type=float, default=0.5)
+    parser.add_argument("--cosyne_proba", type=float, default=0.2)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--max_generations", type=int, default=100_000)
     parser.add_argument("--checkpoint_every", type=int, default=50)
     parser.add_argument("--log_every", type=int, default=1)
     args = parser.parse_args()
 
+    run_id = int(time.time())
     B = args.batch_size
     N = GRAPH_SIZES[args.graph]
-    E = args.eigenvectors + 5
+    E = feature_count(args.eigenvectors)
 
     # Initialise representations of the graph
     adj = init_adj(N, args.graph).astype(np.bool_)
@@ -56,7 +61,7 @@ def main():
     nodes = torch.from_numpy(nodes).cuda()
 
     # Pre-allocate tensors on the GPU
-    population = np.random.normal(0.0, 0.3, (B, E)).astype(np.float32)
+    population = np.random.normal(0.0, args.init_stdev, (B, E)).astype(np.float32)
     elites = torch.empty((N, E), dtype=torch.float32).cuda()
 
     bkup_adjs = torch.from_numpy(adjs).cuda()
@@ -69,7 +74,7 @@ def main():
     elite_fitnesses = torch.full((N, ), 999999, dtype=torch.int).cuda()
 
     elite_range = torch.ones((N, ), dtype=torch.float32, device="cuda") / B
-    ts = torch.arange(0, N, math.ceil(N / 20)).cuda()
+    ts = torch.arange(N).cuda()
 
     logits = torch.empty((B, N), dtype=torch.float32).cuda()
 
@@ -97,23 +102,31 @@ def main():
         # Create next population
         idx = torch.multinomial(elite_range, B, replacement=N < B)
         population[:] = elites[idx]
-        mask = torch.rand((B, E), device="cuda") > 0.5
-        population += torch.normal(0.0, 0.3, (B, E), device="cuda") * mask
+        mask = torch.rand((B, E), device="cuda") > args.mutation_proba
+        population += torch.normal(0.0, args.mutation_stdev, (B, E), device="cuda") * mask
+        
+        permutations = int(population.shape[0] * population.shape[1] * args.cosyne_proba)
+        target_rows = torch.randint(0, population.shape[0], (permutations, ))
+        origin_rows = torch.randint(0, population.shape[0], (permutations, ))
+        cols = torch.randint(0, population.shape[1], (permutations, ))
+        population[target_rows, cols] = population[origin_rows, cols]
 
         if generation % args.log_every == 0:
             # Log stats
             runtime = time.perf_counter() - start
-            degrees = elite_fitnesses[ts]
-            hvi = calculate_hvi(ts, degrees, N)
-            print(f"{generation} | {runtime / args.log_every:3.2f} | {(B * args.log_every)/runtime:3.2f} | {best.values.sum()} | {elite_fitnesses.sum()} | {hvi}")
+            _, hvi = calculate_hvi(ts, elite_fitnesses, N)
+            stats = [run_id, time.time(), generation, runtime / args.log_every, (B * args.log_every)/runtime, best.values.sum(), elite_fitnesses.sum(), hvi]
+            message = "|".join([f"{stat:3.2f}" if isinstance(stat, float) else f"{stat}" for stat in stats])
+            print(message)
+            with open(f"logs/{args.graph}/log.log", "+a") as f:
+                f.write(message + "\n")
 
         if generation % args.checkpoint_every == 0:
             # Checkpoint progress
 
             # Submission
-            degrees = elite_fitnesses[ts]
-            hvi = calculate_hvi(ts, degrees, N)
-            submission = create_submission(elites, nodes, ts, args.graph)
+            selected_ts, hvi = calculate_hvi(ts, elite_fitnesses, N)
+            submission = create_submission(elites, nodes, selected_ts, args.graph)
             submission_path = f"submissions/{args.graph}/{hvi}.json"
             if not os.path.exists(submission_path):
                 with open(submission_path, "w") as f:
@@ -140,23 +153,44 @@ def create_submission(elites, nodes, ts, graph):
     return {
         "challenge": "spoc-3-torso-decompositions",
         "problem": graph,
-        "decisionVector": [perm.tolist() + [t.item()] for perm, t in zip(perms[ts].cpu(), ts.cpu())],
+        "decisionVector": [perm.tolist() + [t.item()] for perm, t in zip(perms[ts].cpu(), ts)],
     }
 
 
 def calculate_hvi(ts, degrees, N):
-    """Calculate the Hyper Volume Indicator used to score a submission."""
-    area = 0
-    for i in range(len(ts)):
-        degree = degrees[i].item()
-        previous_degree = degrees[i - 1].item() if i != 0 else N
-        x = ts[i].item()
-        y = degree
-        dx = N - x
-        dy = previous_degree - y
-        contribution = dx * dy
-        area += contribution
-    return -area
+    """Pick a subset of ts and calculate the hyper volume indicator (HVI)."""
+    degrees = degrees.cpu().numpy()
+    ts = ts.cpu().numpy()
+    min_degree = np.full_like(degrees, N)
+    min_t = np.full_like(ts, N)
+    hvi = 0
+    selected = []
+    for _ in range(20):
+        area = (min_t - ts) * (min_degree - degrees)
+        argmax = np.argmax(area)
+        selected.append(argmax)
+        t = ts[argmax]
+        degree = degrees[argmax]
+        contribution = (min_degree[argmax] - degree) * (min_t[argmax] - t)    
+
+        i = argmax
+        while i >= 0 and i < N and min_degree[i] > degree:
+            min_degree[i] = degree
+            i += 1
+        
+        i = argmax
+        while i >= 0 and i < N and min_t[i] > t:
+            min_t[i] = t
+            i -= 1
+        
+        hvi -= contribution
+    return np.array(selected), hvi
+
+
+def feature_count(eigenvectors):
+    raw_features = (eigenvectors + 5)
+    features = raw_features + raw_features + (math.factorial(raw_features) // (math.factorial(2) * math.factorial(raw_features - 2)))
+    return features
 
 
 def init_adj(N, graph):
@@ -176,7 +210,8 @@ def init_node_features(adj, eigenvectors):
     """Initialise node features based on the graph topology."""
     N = adj.shape[0]
     degree_profile = 5
-    features = eigenvectors + degree_profile
+    raw_features = degree_profile + eigenvectors
+    features = feature_count(eigenvectors)
     nodes = np.zeros((N, features), dtype=np.float32)
 
     # Degree based features based on pytorch geometrics 'LocalDegreeProfile' https://pytorch-geometric.readthedocs.io/en/2.5.0/_modules/torch_geometric/transforms/local_degree_profile.html#LocalDegreeProfile
@@ -193,7 +228,16 @@ def init_node_features(adj, eigenvectors):
     eig_vals, eig_vecs = eigh(lap)
     eig_vecs = np.real(eig_vecs[:, eig_vals.argsort()])
     pe = eig_vecs[:, 1: eigenvectors + 1]
-    nodes[:, degree_profile:] = pe
+    nodes[:, degree_profile: degree_profile + eigenvectors] = pe
+
+    # Create polynomial features based on 'PolynomialFeatures' from: https://github.com/scikit-learn/scikit-learn/blob/2621573e60c295a435c62137c65ae787bf438e61/sklearn/preprocessing/_polynomial.py#L99
+    from itertools import combinations
+    # Powers
+    for i in range(raw_features):
+        nodes[:, raw_features + i] = nodes[:, i] ** 2
+    # Interactions
+    for ii, (i, j) in enumerate(combinations(list(range(raw_features)), 2)):
+        nodes[:, raw_features + raw_features + ii] = nodes[:, i] * nodes[:, j]
 
     # Normalisation (mean 0.0, stdev 1.0)
     means = np.empty((features, ), dtype=np.float32)
